@@ -694,3 +694,44 @@ def test_when_state_observed_expect_response_reports_missing_configured_componen
 
     response = engine.set_system_state(_state())
     assert response.missing_components == []
+
+
+def test_when_a_transition_is_not_observed_yet_expect_no_next_transition(foreman_config):
+    """
+    A transition whose service answered before /activity reported it is not issued again.
+
+    Planning waits until the observed state shows the last command's target.
+    """
+    engine = _prepare_engine(foreman_config)
+    engine.request_profile("active")
+
+    cmd = engine.get_next_transition()
+    assert cmd is not None and cmd.component.name == "hw1"
+    assert cmd.goal_state == LifecycleState.INACTIVE
+
+    # The service answered, the report has not arrived: nothing to issue yet.
+    assert engine.get_next_transition() is None
+    # A report still showing the old state changes nothing.
+    engine.set_system_state(_state())
+    assert engine.get_next_transition() is None
+
+    # Observed: the next step is planned from the new state.
+    engine.set_system_state(_state(hw1=LifecycleState.INACTIVE))
+    nxt = engine.get_next_transition()
+    assert nxt is not None and nxt.component.name == "hw1"
+    assert nxt.goal_state == LifecycleState.ACTIVE
+    assert engine.get_engine_snapshot().error.is_error is False
+
+
+def test_when_a_new_profile_is_requested_after_an_unobserved_command_expect_planning_resumes(
+    foreman_config,
+):
+    """A command never observed does not hold the engine forever: a new request plans again."""
+    engine = _prepare_engine(foreman_config)
+    engine.request_profile("active")
+    assert engine.get_next_transition() is not None
+    assert engine.get_next_transition() is None
+
+    engine.request_profile("all_inactive")
+    engine.request_profile("active")
+    assert engine.get_next_transition() is not None

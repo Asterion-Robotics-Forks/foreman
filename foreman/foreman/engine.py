@@ -144,6 +144,11 @@ class ForemanEngine:
                 return None
             if self._reached_target:
                 return None
+            # The last command not observed yet: its service may have answered before the
+            # component's new state was reported, and planning from the old state would issue
+            # the same transition again, which a strict switch then rejects.
+            if self._awaiting_observation():
+                return None
 
             cmd = self._planner.get_next_transition(self._state, self._target_profile)
             self._last_issued_command = cmd
@@ -301,6 +306,14 @@ class ForemanEngine:
                     else []
                 ),
             )
+
+    def _awaiting_observation(self) -> bool:
+        """Check if the last issued command has not yet been observed. Caller holds the lock."""
+        cmd = self._last_issued_command
+        if cmd is None:
+            return False
+        observed = self._state.components.get(cmd.component.name)
+        return observed is None or observed.lifecycle_state != cmd.goal_state
 
     def _is_at_profile(self) -> bool:
         """
