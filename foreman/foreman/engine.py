@@ -1,4 +1,5 @@
 import threading
+import time
 from typing import Dict, List, Optional
 
 from foreman.parser import ParsedScenario
@@ -24,8 +25,17 @@ class ForemanEngine:
     All business logic is here, no ROS, just python.
     """
 
-    def __init__(self, config: ParsedScenario, state_lock: threading.Lock):
+    def __init__(
+        self,
+        config: ParsedScenario,
+        state_lock: threading.Lock,
+        *,
+        observation_timeout_s: float = 5.0,
+        clock=time.monotonic,
+    ):
         self._config = config
+        self._observation_timeout_s = observation_timeout_s
+        self._clock = clock
         self._planner = Planner(config.dependency_rules)
         self._state = SystemState()
         self._state_lock = state_lock
@@ -35,6 +45,8 @@ class ForemanEngine:
         self._is_ready = False  # when we get first /activity reading
         self._error_state: Optional[ForemanError] = None
         self._last_issued_command: Optional[SystemTransitionCommand] = None
+        # When planning first found the last command unobserved.
+        self._awaiting_since: Optional[float] = None
         self._reached_target = False  # latches True once at_profile, until the next request
 
     @property
@@ -148,11 +160,43 @@ class ForemanEngine:
             # component's new state was reported, and planning from the old state would issue
             # the same transition again, which a strict switch then rejects.
             if self._awaiting_observation():
+                # Counted from the first call after the command, which the node makes once its
+                # service answered: a slow transition is not mistaken for an unobserved one.
+                now = self._clock()
+                if self._awaiting_since is None:
+                    self._awaiting_since = now
+                elif now - self._awaiting_since > self._observation_timeout_s:
+                    self._abort_unobserved()
                 return None
 
             cmd = self._planner.get_next_transition(self._state, self._target_profile)
             self._last_issued_command = cmd
+            self._awaiting_since = None
             return cmd
+
+    def _abort_unobserved(self):
+        """
+        Give up the profile when the last command's result never showed.
+
+        Its service answered, but the component was never observed at the goal: a
+        controller that fails its first update is deactivated before /activity
+        reports it active. Ends the request instead of holding it; the next
+        request plans the step again.
+        MUST be called while holding self._state_lock!
+        """
+        cmd = self._last_issued_command
+        observed = self._state.components.get(cmd.component.name)
+        self._error_state = ForemanError(
+            category=ForemanErrorCategory.EXECUTION,
+            message=(
+                f"'{cmd.component.name}' not observed {cmd.goal_state.name} within "
+                f"{self._observation_timeout_s:g} s of its transition (observed: "
+                f"{observed.lifecycle_state.name if observed else 'nothing'})."
+            ),
+            component_names=[cmd.component.name],
+        )
+        self._last_issued_command = None
+        self._target_profile = None
 
     def set_system_state(self, components: List[Component]) -> ForemanResponse:
         """

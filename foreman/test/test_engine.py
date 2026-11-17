@@ -735,3 +735,40 @@ def test_when_a_new_profile_is_requested_after_an_unobserved_command_expect_plan
     engine.request_profile("all_inactive")
     engine.request_profile("active")
     assert engine.get_next_transition() is not None
+
+
+def test_when_a_transition_is_never_observed_expect_the_profile_aborted(foreman_config):
+    """
+    A command whose result never shows (a controller that fails its first update is
+    deactivated before /activity reports it active) ends the request with an error
+    once the observation bound passes, instead of holding it forever.
+    """
+    now = [0.0]
+    engine = ForemanEngine(
+        foreman_config, threading.Lock(), observation_timeout_s=5.0, clock=lambda: now[0]
+    )
+    engine.set_system_state(_state())
+    engine.request_profile("active")
+    cmd = engine.get_next_transition()
+    assert cmd is not None
+
+    # A slow service: the node plans again only once it answered, 30 s later.
+    now[0] = 30.0
+    assert engine.get_next_transition() is None
+    now[0] = 34.9
+    engine.set_system_state(_state())
+    assert engine.get_next_transition() is None
+    assert engine.get_engine_snapshot().error.is_error is False
+
+    now[0] = 35.1
+    assert engine.get_next_transition() is None
+    error = engine.get_engine_snapshot().error
+    assert error.is_error is True
+    assert error.category == ForemanErrorCategory.EXECUTION.value
+    assert error.components == [cmd.component.name]
+
+    # The caller's next request plans the same step again.
+    engine.request_profile("active")
+    again = engine.get_next_transition()
+    assert again is not None and again.component.name == cmd.component.name
+    assert engine.get_engine_snapshot().error.is_error is False
